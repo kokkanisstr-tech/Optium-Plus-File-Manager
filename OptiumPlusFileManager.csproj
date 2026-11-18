@@ -1,0 +1,58 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <AssemblyTitle>Optium+ File Manager</AssemblyTitle>
+    <Product>Optium+ File Manager</Product>
+    <Description>Windows file manager with local content analysis, OCR, and optional AI-assisted search.</Description>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
+    <PublishTrimmed>false</PublishTrimmed>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>None</DebugType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="Domain\OptiumPlusFileManager.Domain.csproj" />
+    <ProjectReference Include="Application\OptiumPlusFileManager.Application.csproj" />
+    <ProjectReference Include="Infrastructure\OptiumPlusFileManager.Infrastructure.csproj" />
+    <ProjectReference Include="Worker\OptiumPlusFileManager.Worker.csproj" />
+    <ProjectReference Include="Api\OptiumPlusFileManager.Api.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="third_party\tesseract\tessdata\*.traineddata">
+      <Link>tessdata\%(Filename)%(Extension)</Link>
+      <TargetPath>tessdata\%(Filename)%(Extension)</TargetPath>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+    <Content Include="third_party\THIRD_PARTY_NOTICES.md">
+      <Link>THIRD_PARTY_NOTICES.md</Link>
+      <TargetPath>THIRD_PARTY_NOTICES.md</TargetPath>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="Api\**\*.cs" />
+    <Compile Remove="Application\**\*.cs" />
+    <Compile Remove="Domain\**\*.cs" />
+    <Compile Remove="Infrastructure\**\*.cs" />
+    <Compile Remove="Worker\**\*.cs" />
+    <Compile Remove="tests\**\*.cs" />
+  </ItemGroup>
+
+</Project>

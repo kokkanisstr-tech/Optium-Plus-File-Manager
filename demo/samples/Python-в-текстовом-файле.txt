@@ -1,0 +1,7 @@
+from pathlib import Path
+
+def count_items(values: list[str]) -> int:
+    return len(values)
+
+if __name__ == "__main__":
+    print(count_items(["лекция", "практика"]))
