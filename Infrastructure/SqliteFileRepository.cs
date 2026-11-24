@@ -7,8 +7,9 @@ using System.Text.Json;
 
 namespace OptiumPlusFileManager.Infrastructure;
 
-public sealed class SqliteFileRepository : IFileRepository
+public sealed class SqliteFileRepository : IFileRepository, IFileSearchIndex
 {
+    private const int CurrentSearchIndexVersion = 1;
     private readonly string _connectionString;
     private readonly string _logFolder;
     private readonly SemaphoreSlim _logLock = new(1, 1);
@@ -105,9 +106,32 @@ public sealed class SqliteFileRepository : IFileRepository
                 MonthUtc TEXT PRIMARY KEY,
                 RequestCount INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS SearchIndexDocuments (
+                RowId INTEGER PRIMARY KEY AUTOINCREMENT,
+                FileId TEXT NOT NULL UNIQUE,
+                FilePath TEXT NOT NULL,
+                FileName TEXT NOT NULL,
+                FileType TEXT NOT NULL,
+                Content TEXT NOT NULL,
+                NameTerms TEXT NOT NULL,
+                ContentTerms TEXT NOT NULL,
+                SizeBytes INTEGER NOT NULL,
+                LastWriteTicks INTEGER NOT NULL
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS SearchIndexFts USING fts5(
+                NameTerms, ContentTerms, tokenize='unicode61 remove_diacritics 2'
+            );
+            CREATE TABLE IF NOT EXISTS SearchIndexState (
+                Id INTEGER PRIMARY KEY CHECK (Id = 1),
+                IsReady INTEGER NOT NULL DEFAULT 0,
+                IndexVersion INTEGER NOT NULL DEFAULT 1
+            );
+            INSERT OR IGNORE INTO SearchIndexState (Id, IsReady, IndexVersion) VALUES (1, 0, 1);
             """;
         await command.ExecuteNonQueryAsync(cancellationToken);
         await EnsurePendingDestinationColumnAsync(connection, cancellationToken);
+        await EnsureSearchIndexVersionColumnAsync(connection, cancellationToken);
+        await ResetOutdatedSearchIndexAsync(connection, cancellationToken);
         foreach (var category in Domain.CategoryCatalog.Categories)
         {
             await using var seed = connection.CreateCommand();
@@ -117,6 +141,157 @@ public sealed class SqliteFileRepository : IFileRepository
             seed.Parameters.AddWithValue("$directory", category.DirectoryName);
             await seed.ExecuteNonQueryAsync(cancellationToken);
         }
+    }
+
+    public async Task UpsertSearchDocumentAsync(SearchIndexDocument document, CancellationToken cancellationToken = default)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+
+        long? rowId;
+        await using (var find = connection.CreateCommand())
+        {
+            find.Transaction = transaction;
+            find.CommandText = "SELECT RowId FROM SearchIndexDocuments WHERE FileId=$id;";
+            find.Parameters.AddWithValue("$id", document.FileId);
+            var value = await find.ExecuteScalarAsync(cancellationToken);
+            rowId = value is null or DBNull ? null : Convert.ToInt64(value, System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        if (rowId is not null)
+        {
+            await using var remove = connection.CreateCommand();
+            remove.Transaction = transaction;
+            remove.CommandText = "DELETE FROM SearchIndexFts WHERE rowid=$rowid;";
+            remove.Parameters.AddWithValue("$rowid", rowId.Value);
+            await remove.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        await using (var save = connection.CreateCommand())
+        {
+            save.Transaction = transaction;
+            save.CommandText = """
+                INSERT INTO SearchIndexDocuments
+                    (FileId, FilePath, FileName, FileType, Content, NameTerms, ContentTerms, SizeBytes, LastWriteTicks)
+                VALUES ($id, $path, $name, $type, $content, $nameTerms, $contentTerms, $size, $lastWrite)
+                ON CONFLICT(FileId) DO UPDATE SET
+                    FilePath=excluded.FilePath, FileName=excluded.FileName, FileType=excluded.FileType,
+                    Content=excluded.Content, NameTerms=excluded.NameTerms, ContentTerms=excluded.ContentTerms,
+                    SizeBytes=excluded.SizeBytes, LastWriteTicks=excluded.LastWriteTicks;
+                """;
+            AddSearchDocumentParameters(save, document);
+            await save.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        await using (var find = connection.CreateCommand())
+        {
+            find.Transaction = transaction;
+            find.CommandText = "SELECT RowId FROM SearchIndexDocuments WHERE FileId=$id;";
+            find.Parameters.AddWithValue("$id", document.FileId);
+            rowId = Convert.ToInt64(await find.ExecuteScalarAsync(cancellationToken), System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        await using (var addToFts = connection.CreateCommand())
+        {
+            addToFts.Transaction = transaction;
+            addToFts.CommandText = "INSERT INTO SearchIndexFts (rowid, NameTerms, ContentTerms) VALUES ($rowid, $nameTerms, $contentTerms);";
+            addToFts.Parameters.AddWithValue("$rowid", rowId.Value);
+            addToFts.Parameters.AddWithValue("$nameTerms", document.NormalizedName);
+            addToFts.Parameters.AddWithValue("$contentTerms", document.NormalizedContent);
+            await addToFts.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    public async Task RemoveSearchDocumentAsync(string fileId, CancellationToken cancellationToken = default)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+        await using (var removeFts = connection.CreateCommand())
+        {
+            removeFts.Transaction = transaction;
+            removeFts.CommandText = "DELETE FROM SearchIndexFts WHERE rowid=(SELECT RowId FROM SearchIndexDocuments WHERE FileId=$id);";
+            removeFts.Parameters.AddWithValue("$id", fileId);
+            await removeFts.ExecuteNonQueryAsync(cancellationToken);
+        }
+        await using (var removeDocument = connection.CreateCommand())
+        {
+            removeDocument.Transaction = transaction;
+            removeDocument.CommandText = "DELETE FROM SearchIndexDocuments WHERE FileId=$id;";
+            removeDocument.Parameters.AddWithValue("$id", fileId);
+            await removeDocument.ExecuteNonQueryAsync(cancellationToken);
+        }
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    public async Task<SearchIndexMetadata?> GetSearchIndexMetadataAsync(string fileId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT SizeBytes, LastWriteTicks FROM SearchIndexDocuments WHERE FileId=$id;";
+        command.Parameters.AddWithValue("$id", fileId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken)
+            ? new SearchIndexMetadata(reader.GetInt64(0), reader.GetInt64(1))
+            : null;
+    }
+
+    public async Task<IReadOnlyList<SearchIndexDocument>> SearchIndexAsync(string matchExpression,
+        IReadOnlyList<string> terms, int take,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(matchExpression) || terms.Count == 0) return [];
+        take = Math.Clamp(take, 1, 5000);
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        var nameMatches = BuildMatchedTermsSql("d.NameTerms", terms.Count, "nameTerm");
+        var contentMatches = BuildMatchedTermsSql("d.ContentTerms", terms.Count, "contentTerm");
+        command.CommandText = $"""
+            SELECT d.FileId, f.CurrentPath, d.FileName, d.FileType, substr(d.Content, 1, 8000),
+                d.SizeBytes, d.LastWriteTicks, {nameMatches}, {contentMatches}
+            FROM SearchIndexFts
+            JOIN SearchIndexDocuments d ON d.RowId=SearchIndexFts.rowid
+            JOIN Files f ON f.Id=d.FileId
+            WHERE SearchIndexFts MATCH $match AND f.Status='Completed'
+            ORDER BY bm25(SearchIndexFts, 4.0, 1.0), d.FileName COLLATE NOCASE
+            LIMIT $take;
+            """;
+        command.Parameters.AddWithValue("$match", matchExpression);
+        command.Parameters.AddWithValue("$take", take);
+        for (var index = 0; index < terms.Count; index++)
+        {
+            command.Parameters.AddWithValue($"$nameTerm{index}", terms[index]);
+            command.Parameters.AddWithValue($"$contentTerm{index}", terms[index]);
+        }
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var documents = new List<SearchIndexDocument>();
+        while (await reader.ReadAsync(cancellationToken))
+            documents.Add(new SearchIndexDocument(reader.GetString(0), reader.GetString(1), reader.GetString(2),
+                reader.GetString(3), reader.GetString(4), string.Empty, string.Empty, reader.GetInt64(5),
+                reader.GetInt64(6), reader.GetString(7), reader.GetString(8)));
+        return documents;
+    }
+
+    public async Task<bool> IsSearchIndexReadyAsync(CancellationToken cancellationToken = default)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT IsReady, IndexVersion FROM SearchIndexState WHERE Id=1;";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) && reader.GetInt32(0) != 0 &&
+               reader.GetInt32(1) == CurrentSearchIndexVersion;
+    }
+
+    public async Task SetSearchIndexReadyAsync(bool ready, CancellationToken cancellationToken = default)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "UPDATE SearchIndexState SET IsReady=$ready, IndexVersion=$version WHERE Id=1;";
+        command.Parameters.AddWithValue("$ready", ready ? 1 : 0);
+        command.Parameters.AddWithValue("$version", CurrentSearchIndexVersion);
+        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
     public async Task InsertAsync(FileRecord file, string details, CancellationToken cancellationToken = default)
@@ -468,6 +643,24 @@ public sealed class SqliteFileRepository : IFileRepository
         command.Parameters.AddWithValue("$updated", file.UpdatedAtUtc is null ? DBNull.Value : ToDb(file.UpdatedAtUtc.Value));
     }
 
+    private static void AddSearchDocumentParameters(SqliteCommand command, SearchIndexDocument document)
+    {
+        command.Parameters.AddWithValue("$id", document.FileId);
+        command.Parameters.AddWithValue("$path", Path.GetFullPath(document.FilePath));
+        command.Parameters.AddWithValue("$name", document.FileName);
+        command.Parameters.AddWithValue("$type", document.FileType);
+        command.Parameters.AddWithValue("$content", document.Content);
+        command.Parameters.AddWithValue("$nameTerms", document.NormalizedName);
+        command.Parameters.AddWithValue("$contentTerms", document.NormalizedContent);
+        command.Parameters.AddWithValue("$size", document.SizeBytes);
+        command.Parameters.AddWithValue("$lastWrite", document.LastWriteTicks);
+    }
+
+    private static string BuildMatchedTermsSql(string column, int termCount, string parameterPrefix) =>
+        string.Join(" || ", Enumerable.Range(0, termCount).Select(index =>
+            $"CASE WHEN instr(' ' || {column} || ' ', ' ' || ${parameterPrefix}{index} || ' ') > 0 " +
+            $"THEN ${parameterPrefix}{index} || ' ' ELSE '' END"));
+
     private static FileRecord ReadFile(SqliteDataReader reader) => new()
     {
         Id = reader.GetString(reader.GetOrdinal("Id")),
@@ -520,6 +713,43 @@ public sealed class SqliteFileRepository : IFileRepository
         await using var alter = connection.CreateCommand();
         alter.CommandText = "ALTER TABLE Files ADD COLUMN PendingDestinationPath TEXT NULL;";
         await alter.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task EnsureSearchIndexVersionColumnAsync(SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = "PRAGMA table_info(SearchIndexState);";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var found = false;
+        while (await reader.ReadAsync(cancellationToken))
+            if (reader.GetString(1).Equals("IndexVersion", StringComparison.OrdinalIgnoreCase)) found = true;
+        await reader.DisposeAsync();
+        if (found) return;
+        await using var alter = connection.CreateCommand();
+        alter.CommandText = "ALTER TABLE SearchIndexState ADD COLUMN IndexVersion INTEGER NOT NULL DEFAULT 1;";
+        await alter.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task ResetOutdatedSearchIndexAsync(SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        await using var versionQuery = connection.CreateCommand();
+        versionQuery.CommandText = "SELECT IndexVersion FROM SearchIndexState WHERE Id=1;";
+        var versionValue = await versionQuery.ExecuteScalarAsync(cancellationToken);
+        if (versionValue is not null and not DBNull &&
+            Convert.ToInt32(versionValue, System.Globalization.CultureInfo.InvariantCulture) == CurrentSearchIndexVersion)
+            return;
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            DELETE FROM SearchIndexFts;
+            DELETE FROM SearchIndexDocuments;
+            UPDATE SearchIndexState SET IsReady=0, IndexVersion=$version
+            WHERE Id=1 AND IndexVersion<>$version;
+            """;
+        command.Parameters.AddWithValue("$version", CurrentSearchIndexVersion);
+        await command.ExecuteNonQueryAsync(cancellationToken);
     }
     private static string ToDb(DateTime value) => value.ToUniversalTime().ToString("O", System.Globalization.CultureInfo.InvariantCulture);
     private static string FileNameRulePattern(string fileName) => "filename:" + Path.GetFileName(fileName).Trim().ToUpperInvariant();

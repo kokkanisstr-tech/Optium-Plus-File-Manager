@@ -15,8 +15,12 @@ internal sealed class MainForm : Form
     private readonly LocalApiServer _apiServer;
     private readonly ApiTokenStore _apiTokens;
     private readonly bool _startMinimized;
-    private readonly TabControl _tabs = new();
+    private readonly Panel _pageHost = new();
+    private readonly Dictionary<string, Control> _pages = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, Button> _navigationButtons = new(StringComparer.Ordinal);
     private readonly Label _status = new();
+    private readonly TextBox _globalSearch = new();
+    private readonly Button _globalSearchButton = new();
     private readonly Label _apiStatus = new();
     private readonly Label _apiAddress = new();
     private readonly TextBox _readToken = new();
@@ -86,6 +90,8 @@ internal sealed class MainForm : Form
         Size = new Size(Math.Min(1320, workArea.Width), Math.Min(860, workArea.Height));
         BackColor = Color.FromArgb(246, 248, 251);
         Font = new Font("Segoe UI", 9.5f);
+        KeyPreview = true;
+        KeyDown += HandleGlobalShortcut;
         AllowDrop = true;
         DragEnter += HandleDragEnter;
         DragDrop += HandleDragDrop;
@@ -125,19 +131,41 @@ internal sealed class MainForm : Form
         Controls.Add(root);
 
         root.Controls.Add(BuildHeader(), 0, 0);
-        _tabs.Dock = DockStyle.Fill;
-        _tabs.Appearance = TabAppearance.Normal;
-        _tabs.DrawMode = TabDrawMode.OwnerDrawFixed;
-        _tabs.ItemSize = new Size(150, 34);
-        _tabs.SizeMode = TabSizeMode.Fixed;
-        _tabs.DrawItem += DrawTab;
-        _tabs.TabPages.Add(BuildDashboardTab());
-        _tabs.TabPages.Add(BuildSearchTab());
-        _tabs.TabPages.Add(BuildReviewTab());
-        _tabs.TabPages.Add(BuildHistoryTab());
-        _tabs.TabPages.Add(BuildSettingsTab());
-        _tabs.TabPages.Add(BuildApiTab());
-        root.Controls.Add(_tabs, 0, 1);
+
+        var workspace = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty
+        };
+        workspace.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 188));
+        workspace.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        workspace.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        workspace.Controls.Add(BuildNavigation(), 0, 0);
+
+        _pageHost.Dock = DockStyle.Fill;
+        _pageHost.Margin = new Padding(12, 0, 0, 0);
+        var pageDefinitions = new (string Key, TabPage Page)[]
+        {
+            ("home", BuildDashboardTab()),
+            ("search", BuildSearchTab()),
+            ("review", BuildReviewTab()),
+            ("history", BuildHistoryTab()),
+            ("settings", BuildSettingsTab()),
+            ("api", BuildApiTab())
+        };
+        foreach (var (key, page) in pageDefinitions)
+        {
+            page.Dock = DockStyle.Fill;
+            page.Visible = false;
+            _pages.Add(key, page);
+            _pageHost.Controls.Add(page);
+        }
+        workspace.Controls.Add(_pageHost, 1, 0);
+        root.Controls.Add(workspace, 0, 1);
+        SelectPage("home");
 
         var statusPanel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(2, 4, 2, 0) };
         _status.Dock = DockStyle.Fill;
@@ -160,7 +188,7 @@ internal sealed class MainForm : Form
         };
         var subtitle = new Label
         {
-            Text = "Локальная сортировка, ручная проверка и безопасные интеграции",
+            Text = "Автоматическая сортировка и быстрый поиск по файлам",
             ForeColor = Color.FromArgb(94, 106, 124),
             AutoSize = true,
             Location = new Point(4, 42)
@@ -178,12 +206,122 @@ internal sealed class MainForm : Form
         };
         header.Resize += (_, _) =>
         {
-            _darkTheme.Left = Math.Max(260, header.ClientSize.Width - _darkTheme.Width);
+            _darkTheme.Left = Math.Max(700, header.ClientSize.Width - _darkTheme.Width);
+            _globalSearch.Width = Math.Max(220, _darkTheme.Left - _globalSearch.Left - _globalSearchButton.Width - 20);
+            _globalSearchButton.Left = _globalSearch.Right + 8;
         };
+        _globalSearch.PlaceholderText = "Поиск по имени и содержимому…  Ctrl+K";
+        _globalSearch.Location = new Point(398, 16);
+        _globalSearch.Size = new Size(390, 30);
+        _globalSearch.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+        _globalSearch.KeyDown += async (_, args) =>
+        {
+            if (args.KeyCode != Keys.Enter) return;
+            args.SuppressKeyPress = true;
+            await RunGlobalSearchAsync();
+        };
+        _globalSearchButton.Text = "Найти";
+        _globalSearchButton.Size = new Size(76, 32);
+        _globalSearchButton.Location = new Point(796, 15);
+        _globalSearchButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        _globalSearchButton.Tag = "accent";
+        _globalSearchButton.FlatStyle = FlatStyle.Flat;
+        _globalSearchButton.FlatAppearance.BorderSize = 0;
+        _globalSearchButton.Click += async (_, _) => await RunGlobalSearchAsync();
         header.Controls.Add(title);
         header.Controls.Add(subtitle);
+        header.Controls.Add(_globalSearch);
+        header.Controls.Add(_globalSearchButton);
         header.Controls.Add(_darkTheme);
         return header;
+    }
+
+    private Control BuildNavigation()
+    {
+        var navigation = new Panel { Dock = DockStyle.Fill, Padding = new Padding(8, 10, 8, 8) };
+        var heading = new Label
+        {
+            Text = "РАЗДЕЛЫ",
+            Dock = DockStyle.Top,
+            Height = 30,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Font = new Font("Segoe UI Semibold", 8.5f, FontStyle.Bold),
+            ForeColor = Color.FromArgb(112, 133, 120),
+            Padding = new Padding(10, 0, 0, 0)
+        };
+        var items = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            FlowDirection = FlowDirection.TopDown,
+            WrapContents = false,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty
+        };
+        var sections = new (string Key, string Title)[]
+        {
+            ("home", "⌂   Главная"),
+            ("search", "⌕   Быстрый поиск"),
+            ("review", "✓   На проверку"),
+            ("history", "◷   История"),
+            ("settings", "⚙   Настройки"),
+            ("api", "⌘   Интеграции")
+        };
+        foreach (var (key, title) in sections)
+        {
+            var button = new Button
+            {
+                Text = title,
+                Width = 164,
+                Height = 44,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Padding = new Padding(10, 0, 4, 0),
+                Margin = new Padding(0, 2, 0, 2),
+                FlatStyle = FlatStyle.Flat,
+                Cursor = Cursors.Hand,
+                Tag = "nav"
+            };
+            button.FlatAppearance.BorderSize = 0;
+            button.Click += (_, _) => SelectPage(key);
+            _navigationButtons.Add(key, button);
+            items.Controls.Add(button);
+        }
+        navigation.Controls.Add(items);
+        navigation.Controls.Add(heading);
+        return navigation;
+    }
+
+    private void SelectPage(string key)
+    {
+        if (!_pages.TryGetValue(key, out var selected)) return;
+        foreach (var (pageKey, page) in _pages)
+            page.Visible = pageKey == key;
+        selected.BringToFront();
+        foreach (var (buttonKey, button) in _navigationButtons)
+        {
+            var selectedPage = buttonKey == key;
+            button.Tag = selectedPage ? "nav-active" : "nav";
+            button.BackColor = selectedPage
+                ? (_darkTheme.Checked ? Color.FromArgb(91, 143, 106) : Color.FromArgb(45, 102, 177))
+                : (_darkTheme.Checked ? Color.FromArgb(22, 33, 27) : Color.White);
+            button.ForeColor = selectedPage || !_darkTheme.Checked
+                ? (selectedPage ? Color.White : Color.FromArgb(28, 42, 63))
+                : Color.FromArgb(226, 235, 228);
+            button.FlatAppearance.MouseOverBackColor = selectedPage
+                ? (_darkTheme.Checked ? Color.FromArgb(91, 143, 106) : Color.FromArgb(45, 102, 177))
+                : (_darkTheme.Checked ? Color.FromArgb(35, 51, 41) : Color.FromArgb(235, 242, 250));
+        }
+    }
+
+    private void HandleGlobalShortcut(object? sender, KeyEventArgs args)
+    {
+        if (args.Control && args.KeyCode == Keys.K)
+        {
+            args.SuppressKeyPress = true;
+            _globalSearch.Focus();
+            _globalSearch.SelectAll();
+        }
     }
 
     private TabPage BuildDashboardTab()
@@ -277,7 +415,7 @@ internal sealed class MainForm : Form
 
     private TabPage BuildSearchTab()
     {
-        var page = CreateTab("ИИ-поиск");
+        var page = CreateTab("Поиск файлов");
         var layout = NewLayout(1, 5);
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
@@ -288,7 +426,7 @@ internal sealed class MainForm : Form
 
         layout.Controls.Add(new Label
         {
-            Text = "Опишите файл обычными словами. По запросу с языком сначала проверяется его папка, затем остальные отсортированные файлы. ИИ учитывает текст документов, код и доступный OCR изображений.",
+            Text = "Опишите файл обычными словами. Локальный поиск проверяет имя и извлечённое содержимое документов, кода и изображений с доступным OCR. Настроенный ИИ может дополнительно оценить найденные результаты.",
             Dock = DockStyle.Fill,
             ForeColor = Color.FromArgb(83, 97, 115),
             TextAlign = ContentAlignment.MiddleLeft
@@ -700,6 +838,13 @@ internal sealed class MainForm : Form
         finally { _refreshing = false; }
     }
 
+    private async Task RunGlobalSearchAsync()
+    {
+        _searchQuery.Text = _globalSearch.Text;
+        SelectPage("search");
+        await RunFileSearchAsync();
+    }
+
     private async Task RunFileSearchAsync()
     {
         var query = _searchQuery.Text.Trim();
@@ -717,7 +862,7 @@ internal sealed class MainForm : Form
         _searchButton.Enabled = false;
         _cancelSearchButton.Enabled = true;
         _searchStatus.ForeColor = Color.FromArgb(78, 88, 103);
-        _searchStatus.Text = "Проверяю содержимое файлов… Первый поиск по большой папке может занять время; повторные запросы выполняются быстрее.";
+        _searchStatus.Text = "Ищу по локальному индексу содержимого…";
         SetStatus("Ищу файл в результатах сортировки…");
         try
         {
@@ -1832,24 +1977,28 @@ internal sealed class MainForm : Form
 
     private void ApplyTheme(bool dark)
     {
-        var background = dark ? Color.FromArgb(15, 23, 42) : Color.FromArgb(246, 248, 251);
-        var surface = dark ? Color.FromArgb(30, 41, 59) : Color.White;
-        var input = dark ? Color.FromArgb(17, 24, 39) : Color.White;
-        var border = dark ? Color.FromArgb(71, 85, 105) : Color.FromArgb(218, 225, 233);
-        var text = dark ? Color.FromArgb(226, 232, 240) : Color.FromArgb(28, 42, 63);
-        var muted = dark ? Color.FromArgb(148, 163, 184) : Color.FromArgb(83, 97, 115);
+        var background = dark ? Color.FromArgb(17, 25, 21) : Color.FromArgb(246, 248, 251);
+        var surface = dark ? Color.FromArgb(27, 40, 33) : Color.White;
+        var input = dark ? Color.FromArgb(19, 30, 24) : Color.White;
+        var border = dark ? Color.FromArgb(57, 76, 63) : Color.FromArgb(218, 225, 233);
+        var text = dark ? Color.FromArgb(226, 235, 228) : Color.FromArgb(28, 42, 63);
+        var muted = dark ? Color.FromArgb(155, 174, 159) : Color.FromArgb(83, 97, 115);
+        var accent = dark ? Color.FromArgb(91, 143, 106) : Color.FromArgb(45, 102, 177);
         BackColor = background;
         ForeColor = text;
         ApplyThemeToControl(this, dark, background, surface, input, border, text, muted);
 
-        _sortNow.BackColor = Color.FromArgb(37, 99, 235);
+        _sortNow.BackColor = accent;
         _sortNow.ForeColor = Color.White;
-        _searchButton.BackColor = Color.FromArgb(37, 99, 235);
+        _searchButton.BackColor = accent;
         _searchButton.ForeColor = Color.White;
+        _globalSearchButton.BackColor = accent;
+        _globalSearchButton.ForeColor = Color.White;
         _darkTheme.ForeColor = text;
         _status.ForeColor = muted;
         _sortedTreeStatus.ForeColor = muted;
-        _tabs.Invalidate();
+        _pageHost.Invalidate();
+        foreach (var button in _navigationButtons.Values) button.Invalidate();
     }
 
     private static void ApplyThemeToControl(Control control, bool dark, Color background, Color surface,
@@ -1892,18 +2041,24 @@ internal sealed class MainForm : Form
         else if (control is Button button)
         {
             var accent = string.Equals(button.Tag?.ToString(), "accent", StringComparison.Ordinal);
+            var navigation = button.Tag?.ToString() is "nav" or "nav-active";
+            var navigationSelected = string.Equals(button.Tag?.ToString(), "nav-active", StringComparison.Ordinal);
             var shortcut = button.Tag is SortedFolderShortcut;
-            button.BackColor = accent ? Color.FromArgb(37, 99, 235) :
+            var themeAccent = dark ? Color.FromArgb(91, 143, 106) : Color.FromArgb(45, 102, 177);
+            button.BackColor = accent || navigationSelected ? themeAccent :
                 shortcut ? (dark ? Color.FromArgb(37, 51, 73) : Color.White) :
-                (dark ? Color.FromArgb(51, 65, 85) : Color.FromArgb(239, 243, 248));
-            button.ForeColor = accent ? Color.White : text;
+                navigation ? (dark ? Color.FromArgb(22, 33, 27) : Color.White) :
+                (dark ? Color.FromArgb(42, 58, 48) : Color.FromArgb(239, 243, 248));
+            button.ForeColor = accent || navigationSelected ? Color.White : text;
             button.FlatStyle = FlatStyle.Flat;
-            button.FlatAppearance.BorderColor = accent ? Color.FromArgb(37, 99, 235) :
+            button.FlatAppearance.BorderColor = accent || navigationSelected ? themeAccent :
                 shortcut && button.Tag is SortedFolderShortcut folderShortcut
                     ? (dark ? Color.FromArgb(71, 85, 105) : ControlPaint.Light(folderShortcut.Color)) : border;
-            button.FlatAppearance.MouseOverBackColor = shortcut
+            button.FlatAppearance.BorderSize = navigation ? 0 : button.FlatAppearance.BorderSize;
+            button.FlatAppearance.MouseOverBackColor = navigationSelected || accent ? themeAccent : shortcut
                 ? (dark ? Color.FromArgb(51, 65, 85) : Color.FromArgb(235, 242, 250))
-                : (dark ? Color.FromArgb(71, 85, 105) : Color.FromArgb(229, 236, 245));
+                : navigation ? (dark ? Color.FromArgb(35, 51, 41) : Color.FromArgb(235, 242, 250))
+                : (dark ? Color.FromArgb(57, 76, 63) : Color.FromArgb(229, 236, 245));
         }
         else if (control is TreeView tree)
         {
@@ -1945,26 +2100,6 @@ internal sealed class MainForm : Form
     }
 
     private sealed record SortedFolderShortcut(string DisplayName, string Path, string Badge, Color Color);
-
-    private void DrawTab(object? sender, DrawItemEventArgs e)
-    {
-        if (sender is not TabControl tabs || e.Index < 0 || e.Index >= tabs.TabPages.Count) return;
-        var dark = _darkTheme.Checked;
-        var selected = tabs.SelectedIndex == e.Index;
-        var background = selected
-            ? (dark ? Color.FromArgb(30, 41, 59) : Color.White)
-            : (dark ? Color.FromArgb(15, 23, 42) : Color.FromArgb(241, 245, 249));
-        var foreground = dark ? Color.FromArgb(226, 232, 240) : Color.FromArgb(28, 42, 63);
-        using var brush = new SolidBrush(background);
-        e.Graphics.FillRectangle(brush, e.Bounds);
-        if (selected)
-        {
-            using var accent = new SolidBrush(Color.FromArgb(37, 99, 235));
-            e.Graphics.FillRectangle(accent, e.Bounds.Left, e.Bounds.Bottom - 3, e.Bounds.Width, 3);
-        }
-        TextRenderer.DrawText(e.Graphics, tabs.TabPages[e.Index].Text, tabs.Font, e.Bounds, foreground,
-            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
-    }
 
     private static TabPage CreateTab(string title) => new(title) { Padding = new Padding(14), BackColor = Color.White };
 

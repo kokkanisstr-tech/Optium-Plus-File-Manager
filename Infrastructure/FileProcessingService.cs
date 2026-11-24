@@ -142,6 +142,14 @@ public sealed class FileProcessingService
 
             if (format.ExtensionConflict)
             {
+                if (_repository is IFileSearchIndex conflictSearchIndex)
+                {
+                    var indexInfo = new FileInfo(fullPath);
+                    await conflictSearchIndex.UpsertSearchDocumentAsync(new SearchIndexDocument(record.Id, fullPath,
+                        normalizedName, format.FileType, string.Empty, FileSearchService.PrepareSearchTerms(normalizedName),
+                        string.Empty, indexInfo.Length, indexInfo.LastWriteTimeUtc.Ticks), cancellationToken);
+                }
+
                 record.CategoryId = "other";
                 record.SubcategoryId = "other";
                 record.Confidence = 0.20;
@@ -151,6 +159,15 @@ public sealed class FileProcessingService
             }
 
             var extracted = await _extractor.ExtractAsync(fullPath, format.FileType, cancellationToken);
+            if (_repository is IFileSearchIndex searchIndex)
+            {
+                var indexedInfo = new FileInfo(fullPath);
+                await searchIndex.UpsertSearchDocumentAsync(new SearchIndexDocument(record.Id, fullPath,
+                    normalizedName, format.FileType, extracted.Text, FileSearchService.PrepareSearchTerms(normalizedName),
+                    FileSearchService.PrepareSearchTerms(extracted.Text), indexedInfo.Length,
+                    indexedInfo.LastWriteTimeUtc.Ticks), cancellationToken);
+            }
+
             var local = _classifier.Classify(format, normalizedName, Path.GetExtension(normalizedName), extracted.Text);
             record.Status = nameof(FileStatus.Classifying);
             record.CategoryId = local.CategoryId;

@@ -13,8 +13,10 @@ public sealed class FileSorterRuntime : IAsyncDisposable
     private readonly FileWatchService _watchService;
     private readonly SemaphoreSlim _settingsLock = new(1, 1);
     private readonly SemaphoreSlim _searchPrivacyLock = new(1, 1);
+    private readonly CancellationTokenSource _searchIndexCancellation = new();
     private readonly bool _persistSettings;
     private HashSet<string>? _knownLocalOnlySearchPaths;
+    private Task? _searchIndexTask;
 
     public FileSorterRuntime()
         : this(CreateDefaultStartup())
@@ -70,6 +72,9 @@ public sealed class FileSorterRuntime : IAsyncDisposable
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
         }
+        if (_repository is IFileSearchIndex searchIndex)
+            _searchIndexTask = Task.Run(() => RebuildSearchIndexAsync(searchIndex, _searchIndexCancellation.Token),
+                CancellationToken.None);
         if (Settings.AutomaticSorting)
             await _watchService.ConfigureAsync(cancellationToken);
     }
@@ -360,8 +365,81 @@ public sealed class FileSorterRuntime : IAsyncDisposable
         var analyzer = new CompositeAiFileSearchAnalyzer(Settings, (count, token) =>
             _repository.TryReserveAiRequestsAsync(count, Settings.MonthlyAiRequestLimit, token));
         var search = new FileSearchService(Paths, Settings, aiAnalyzer: analyzer,
-            knownLocalOnlyCurrentPaths: localOnlyPaths);
+            knownLocalOnlyCurrentPaths: localOnlyPaths, searchIndex: _repository as IFileSearchIndex);
         return await search.SearchAsync(query, cancellationToken);
+    }
+
+    private async Task RebuildSearchIndexAsync(IFileSearchIndex searchIndex, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var detector = new FileFormatDetector();
+            var extractor = new SafeContentExtractor();
+            using var concurrency = new SemaphoreSlim(2, 2);
+            var indexedCount = 0;
+            for (var skip = 0; ; skip += 1000)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var files = await _repository.ListAsync(nameof(FileStatus.Completed), 1000, cancellationToken, skip);
+                var tasks = files.Select(async file =>
+                {
+                    await concurrency.WaitAsync(cancellationToken);
+                    try
+                    {
+                        await IndexExistingFileAsync(file, searchIndex, detector, extractor, cancellationToken);
+                        if (Interlocked.Increment(ref indexedCount) % 100 == 0)
+                            StatusChanged?.Invoke($"Подготовлен поиск по файлам: {indexedCount}.");
+                    }
+                    finally { concurrency.Release(); }
+                });
+                await Task.WhenAll(tasks);
+                if (files.Count < 1000) break;
+            }
+
+            await searchIndex.SetSearchIndexReadyAsync(true, cancellationToken);
+            StatusChanged?.Invoke($"Локальный поисковый индекс готов. Проверено файлов: {indexedCount}.");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException and not AccessViolationException)
+        {
+            StatusChanged?.Invoke("Индекс поиска пока не готов; используется обычный локальный поиск.");
+        }
+    }
+
+    private async Task IndexExistingFileAsync(FileRecord file, IFileSearchIndex searchIndex,
+        FileFormatDetector detector, SafeContentExtractor extractor, CancellationToken cancellationToken)
+    {
+        var path = Path.GetFullPath(file.CurrentPath);
+        if (!FileSafety.IsWithin(path, Paths.Sorted) || FileSafety.HasReparsePoint(path) || !File.Exists(path))
+        {
+            await searchIndex.RemoveSearchDocumentAsync(file.Id, cancellationToken);
+            return;
+        }
+
+        var info = new FileInfo(path);
+        var current = await searchIndex.GetSearchIndexMetadataAsync(file.Id, cancellationToken);
+        if (current is not null && current.SizeBytes == info.Length && current.LastWriteTicks == info.LastWriteTimeUtc.Ticks)
+            return;
+
+        try
+        {
+            var originalLength = info.Length;
+            var originalLastWriteTicks = info.LastWriteTimeUtc.Ticks;
+            var format = await detector.DetectAsync(path, cancellationToken);
+            var content = await extractor.ExtractAsync(path, format.FileType, cancellationToken);
+            info.Refresh();
+            if (!info.Exists || info.Length != originalLength || info.LastWriteTimeUtc.Ticks != originalLastWriteTicks)
+                return;
+
+            await searchIndex.UpsertSearchDocumentAsync(new SearchIndexDocument(file.Id, path, Path.GetFileName(path),
+                format.FileType, content.Text, FileSearchService.PrepareSearchTerms(Path.GetFileName(path)),
+                FileSearchService.PrepareSearchTerms(content.Text), info.Length, info.LastWriteTimeUtc.Ticks), cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException or ArgumentException)
+        {
+            // A single inaccessible or damaged file should not prevent indexing the rest of the library.
+        }
     }
 
     private async Task<HashSet<string>> GetKnownLocalOnlySearchPathsAsync(CancellationToken cancellationToken)
@@ -541,7 +619,11 @@ public sealed class FileSorterRuntime : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        _searchIndexCancellation.Cancel();
+        if (_searchIndexTask is not null)
+            await _searchIndexTask;
         await _watchService.DisposeAsync();
+        _searchIndexCancellation.Dispose();
         _settingsLock.Dispose();
         _searchPrivacyLock.Dispose();
     }

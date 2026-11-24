@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.RegularExpressions;
+using Microsoft.Data.Sqlite;
 using OptiumPlusFileManager.Application;
 using OptiumPlusFileManager.Domain;
 
@@ -19,6 +20,7 @@ public sealed class FileSearchService
     private readonly IFileContentExtractor _extractor;
     private readonly IAiFileSearchAnalyzer? _aiAnalyzer;
     private readonly Func<int, CancellationToken, Task<bool>> _tryReserveAiRequests;
+    private readonly IFileSearchIndex? _searchIndex;
     private static readonly object CacheLock = new();
     private static readonly Dictionary<string, LinkedListNode<SearchCacheEntry>> DocumentCache = new(StringComparer.OrdinalIgnoreCase);
     private static readonly LinkedList<SearchCacheEntry> DocumentCacheLru = new();
@@ -28,7 +30,7 @@ public sealed class FileSearchService
     public FileSearchService(FileSorterPaths paths, AppSettings settings, FileFormatDetector? formatDetector = null,
         IFileContentExtractor? extractor = null, IAiFileSearchAnalyzer? aiAnalyzer = null,
         Func<int, CancellationToken, Task<bool>>? tryReserveAiRequests = null,
-        IEnumerable<string>? knownLocalOnlyCurrentPaths = null)
+        IEnumerable<string>? knownLocalOnlyCurrentPaths = null, IFileSearchIndex? searchIndex = null)
     {
         _paths = paths ?? throw new ArgumentNullException(nameof(paths));
         _settings = settings ?? throw new ArgumentNullException(nameof(settings));
@@ -36,6 +38,7 @@ public sealed class FileSearchService
         _extractor = extractor ?? new SafeContentExtractor();
         _aiAnalyzer = aiAnalyzer;
         _tryReserveAiRequests = tryReserveAiRequests ?? ((_, _) => Task.FromResult(true));
+        _searchIndex = searchIndex;
         _knownLocalOnlyCurrentPaths = NormalizeLocalOnlyPaths(knownLocalOnlyCurrentPaths);
     }
 
@@ -51,6 +54,19 @@ public sealed class FileSearchService
             throw new ArgumentException("Запрос поиска не должен превышать 500 символов.", nameof(query));
 
         var parsedQuery = ParsedSearchQuery.Create(query);
+        if (_searchIndex is not null && parsedQuery.Terms.Count > 0)
+        {
+            try
+            {
+                if (await _searchIndex.IsSearchIndexReadyAsync(cancellationToken))
+                    return await SearchIndexedAsync(query, parsedQuery, cancellationToken);
+            }
+            catch (SqliteException)
+            {
+                // A damaged or unavailable search index must not make local search unusable.
+            }
+        }
+
         var targetFolder = parsedQuery.LanguageId is null ? null : GetLanguageFolder(parsedQuery.LanguageId);
         var scanned = 0;
         var usedAi = false;
@@ -88,6 +104,116 @@ public sealed class FileSearchService
         return new(allResults.Hits, scanned, usedAi, aiProvider, parsedQuery.LanguageName, false,
             BuildMessage(allResults.Hits.Count, scanned, parsedQuery.LanguageName, usedAi, aiFailure, fellBack: false));
     }
+
+    private async Task<FileSearchResult> SearchIndexedAsync(string query, ParsedSearchQuery parsedQuery,
+        CancellationToken cancellationToken)
+    {
+        var matchExpression = string.Join(" OR ", parsedQuery.Terms.Select(term =>
+            $"\"{term.Replace("\"", "\"\"", StringComparison.Ordinal)}\""));
+        var indexed = await _searchIndex!.SearchIndexAsync(matchExpression, parsedQuery.Terms, 1000, cancellationToken);
+        var documents = new List<SearchDocument>(indexed.Count);
+        foreach (var item in indexed)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!FileSafety.IsWithin(item.FilePath, _paths.Sorted) || FileSafety.HasReparsePoint(item.FilePath))
+            {
+                await _searchIndex.RemoveSearchDocumentAsync(item.FileId, cancellationToken);
+                continue;
+            }
+
+            var info = new FileInfo(item.FilePath);
+            if (!info.Exists)
+            {
+                await _searchIndex.RemoveSearchDocumentAsync(item.FileId, cancellationToken);
+                continue;
+            }
+
+            var current = item;
+            if (info.Length != item.SizeBytes || info.LastWriteTimeUtc.Ticks != item.LastWriteTicks)
+            {
+                var refreshed = await ReadDocumentAsync(item.FilePath, cancellationToken);
+                if (refreshed is null)
+                {
+                    await _searchIndex.RemoveSearchDocumentAsync(item.FileId, cancellationToken);
+                    continue;
+                }
+
+                info.Refresh();
+                current = new SearchIndexDocument(item.FileId, refreshed.Path, refreshed.Name, refreshed.FileType,
+                    refreshed.Content, PrepareSearchTerms(refreshed.Name), PrepareSearchTerms(refreshed.Content),
+                    info.Length, info.LastWriteTimeUtc.Ticks, string.Join(' ', refreshed.NameTokens),
+                    string.Join(' ', refreshed.ContentTokens));
+                await _searchIndex.UpsertSearchDocumentAsync(current, cancellationToken);
+            }
+
+            var path = Path.GetFullPath(current.FilePath);
+            var nameTokens = current.MatchedNameTerms.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var contentTokens = current.MatchedContentTerms.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            documents.Add(new SearchDocument(path, current.FileName, current.FileType, GetCategoryPath(path), current.Content,
+                nameTokens, contentTokens));
+        }
+
+        var targetFolder = parsedQuery.LanguageId is null ? null : GetLanguageFolder(parsedQuery.LanguageId);
+        if (targetFolder is not null && Directory.Exists(targetFolder) && IsSafeRoot(targetFolder))
+        {
+            var preferred = documents.Where(document => FileSafety.IsWithin(document.Path, targetFolder)).ToArray();
+            var preferredResult = await SearchIndexedDocumentsAsync(query, parsedQuery, preferred, cancellationToken);
+            if (preferredResult.Hits.Count > 0)
+            {
+                return new(preferredResult.Hits, preferred.Length, preferredResult.UsedAi, preferredResult.AiProviderId,
+                    parsedQuery.LanguageName, false,
+                    BuildMessage(preferredResult.Hits.Count, preferred.Length, parsedQuery.LanguageName,
+                        preferredResult.UsedAi, preferredResult.AiFailed, fellBack: false, indexed: true));
+            }
+
+            var remaining = documents.Where(document => !FileSafety.IsWithin(document.Path, targetFolder)).ToArray();
+            var remainingResult = await SearchIndexedDocumentsAsync(query, parsedQuery, remaining, cancellationToken);
+            var scanned = preferred.Length + remaining.Length;
+            return new(remainingResult.Hits, scanned, remainingResult.UsedAi, remainingResult.AiProviderId,
+                parsedQuery.LanguageName, true,
+                BuildMessage(remainingResult.Hits.Count, scanned, parsedQuery.LanguageName, remainingResult.UsedAi,
+                    remainingResult.AiFailed, fellBack: true, indexed: true));
+        }
+
+        var allResults = await SearchIndexedDocumentsAsync(query, parsedQuery, documents, cancellationToken);
+        return new(allResults.Hits, documents.Count, allResults.UsedAi, allResults.AiProviderId, null, false,
+            BuildMessage(allResults.Hits.Count, documents.Count, null, allResults.UsedAi, allResults.AiFailed,
+                fellBack: false, indexed: true));
+    }
+
+    private async Task<SearchBatchResult> SearchIndexedDocumentsAsync(string query, ParsedSearchQuery parsedQuery,
+        IReadOnlyList<SearchDocument> documents, CancellationToken cancellationToken)
+    {
+        var hits = new Dictionary<string, FileSearchHit>(StringComparer.OrdinalIgnoreCase);
+        var scored = documents.Select(document => new RankedDocument(document, Score(document, parsedQuery.Terms)))
+            .ToArray();
+        foreach (var item in scored.Where(item => item.Score > 0))
+        {
+            var document = item.Document;
+            AddLocalHit(hits, new FileSearchHit(document.Path, document.Name, document.FileType, document.CategoryPath,
+                item.Score, document.ReasonFor(parsedQuery.Terms), false));
+        }
+
+        var analyzer = _aiAnalyzer;
+        var aiActive = analyzer?.IsConfigured == true && !FileSafety.ContainsSecrets("search-query", query) && !LooksLikeAbsolutePath(query);
+        if (aiActive && scored.Length > 0)
+        {
+            var aiCandidates = scored.OrderByDescending(item => item.Score)
+                .ThenBy(item => item.Document.Name, StringComparer.OrdinalIgnoreCase)
+                .Take(MaximumAiCandidates).ToArray();
+            var ai = await AnalyzeAiBatchAsync(query, aiCandidates, hits, cancellationToken);
+            return new(hits.Values.OrderByDescending(hit => hit.Score)
+                .ThenBy(hit => hit.FileName, StringComparer.OrdinalIgnoreCase).Take(100).ToArray(), ai.UsedAi,
+                ai.AiProviderId, ai.AiFailed);
+        }
+
+        return new(hits.Values.OrderByDescending(hit => hit.Score)
+            .ThenBy(hit => hit.FileName, StringComparer.OrdinalIgnoreCase).Take(100).ToArray(), false, null, false);
+    }
+
+    public static string PrepareSearchTerms(string value) => string.Join(' ', ParsedSearchQuery.Tokenize(value));
 
     private async Task<SearchBatchResult> SearchDocumentsAsync(string query, ParsedSearchQuery parsedQuery,
         IEnumerable<string> paths, CancellationToken cancellationToken, Action scanned)
@@ -460,19 +586,22 @@ public sealed class FileSearchService
         return Math.Clamp(0.25 + coverage * 0.45 + Math.Min(0.3, weighted * 0.12), 0.25, 0.95);
     }
 
-    private static string BuildMessage(int matches, int scanned, string? scope, bool usedAi, bool aiFailed, bool fellBack)
+    private static string BuildMessage(int matches, int scanned, string? scope, bool usedAi, bool aiFailed,
+        bool fellBack, bool indexed = false)
     {
+        var scanDescription = indexed ? $"подходящих записей индекса — {scanned}" : $"проверено файлов — {scanned}";
         if (matches == 0)
         {
             var scopeText = fellBack ? $"Папка {scope} и остальные отсортированные папки" : "Отсортированные папки";
             var aiText = aiFailed ? " Облачный ИИ не ответил, поэтому проверка выполнена локально." : string.Empty;
-            return $"Совпадений не найдено. {scopeText}: проверено файлов — {scanned}.{aiText}";
+            return $"Совпадений не найдено. {scopeText}: {scanDescription}.{aiText}";
         }
 
         var fallbackText = fellBack ? $" В папке {scope} совпадений не было, поэтому проверены остальные папки." : string.Empty;
         var aiDescription = usedAi ? " Релевантность дополнительно проверил облачный ИИ." :
             aiFailed ? " Облачный ИИ недоступен; показаны локальные совпадения." : " Выполнен локальный поиск по содержимому.";
-        return $"Показано совпадений: {matches} (не более 100). Проверено файлов: {scanned}.{fallbackText}{aiDescription}";
+        var indexDescription = indexed ? " Поиск выполнен по постоянному индексу." : string.Empty;
+        return $"Показано совпадений: {matches} (не более 100). {scanDescription}.{fallbackText}{aiDescription}{indexDescription}";
     }
 
     private static string Clip(string value, int maximum) => value.Length <= maximum ? value : value[..maximum];

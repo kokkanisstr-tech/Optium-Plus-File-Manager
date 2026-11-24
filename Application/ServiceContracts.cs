@@ -25,6 +25,23 @@ public interface IFileRepository
     Task<int> GetAiRequestsUsedThisMonthAsync(CancellationToken cancellationToken = default);
 }
 
+public interface IFileSearchIndex
+{
+    Task UpsertSearchDocumentAsync(SearchIndexDocument document, CancellationToken cancellationToken = default);
+    Task RemoveSearchDocumentAsync(string fileId, CancellationToken cancellationToken = default);
+    Task<SearchIndexMetadata?> GetSearchIndexMetadataAsync(string fileId, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<SearchIndexDocument>> SearchIndexAsync(string matchExpression, IReadOnlyList<string> terms, int take,
+        CancellationToken cancellationToken = default);
+    Task<bool> IsSearchIndexReadyAsync(CancellationToken cancellationToken = default);
+    Task SetSearchIndexReadyAsync(bool ready, CancellationToken cancellationToken = default);
+}
+
+public sealed record SearchIndexDocument(string FileId, string FilePath, string FileName, string FileType,
+    string Content, string NormalizedName, string NormalizedContent, long SizeBytes, long LastWriteTicks,
+    string MatchedNameTerms = "", string MatchedContentTerms = "");
+
+public sealed record SearchIndexMetadata(long SizeBytes, long LastWriteTicks);
+
 public interface IFileContentExtractor
 {
     Task<ExtractedContent> ExtractAsync(string filePath, string fileType, CancellationToken cancellationToken = default);
