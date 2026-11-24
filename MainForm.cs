@@ -387,7 +387,7 @@ internal sealed class MainForm : Form
         layout.Controls.Add(section, 0, 2);
 
         var sortedArea = NewLayout(1, 3);
-        sortedArea.RowStyles.Add(new RowStyle(SizeType.Absolute, 88));
+        sortedArea.RowStyles.Add(new RowStyle(SizeType.Absolute, 166));
         sortedArea.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         sortedArea.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
         sortedArea.Controls.Add(BuildSortedFolderShortcuts(), 0, 0);
@@ -931,21 +931,11 @@ internal sealed class MainForm : Form
         {
             Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.LeftToRight,
-            WrapContents = false,
-            AutoScroll = true,
+            WrapContents = true,
+            AutoScroll = false,
             Padding = new Padding(2, 3, 2, 3),
             Margin = Padding.Empty
         };
-        panel.Controls.Add(new Label
-        {
-            Text = "Быстрый\nпереход",
-            Width = 78,
-            Height = 74,
-            TextAlign = ContentAlignment.MiddleLeft,
-            Font = Font,
-            ForeColor = Color.FromArgb(49, 62, 81),
-            Margin = new Padding(2, 0, 4, 0)
-        });
 
         var programming = CategoryCatalog.Categories.First(category => category.Id == "programming");
         var documents = CategoryCatalog.Categories.First(category => category.Id == "documents");
@@ -968,11 +958,11 @@ internal sealed class MainForm : Form
 
         foreach (var shortcut in shortcuts)
         {
-            var icon = CreateFolderIcon(44, shortcut.Color, shortcut.Badge);
+            var icon = CreateFolderIcon(50, shortcut.Color, shortcut.Badge);
             _sortedShortcutImages.Add(icon);
             var button = new Button
             {
-                Width = 150,
+                Width = 170,
                 Height = 76,
                 Tag = shortcut,
                 Text = $"{shortcut.DisplayName}\r\nПапка",
@@ -999,8 +989,9 @@ internal sealed class MainForm : Form
 
         void FitShortcutCards()
         {
-            var reservedWidth = panel.Padding.Horizontal + 78 + 6 + shortcuts.Length * 6;
-            var tileWidth = Math.Clamp((panel.ClientSize.Width - reservedWidth) / shortcuts.Length, 116, 150);
+            var columnCount = Math.Clamp((panel.ClientSize.Width - panel.Padding.Horizontal + 6) / 176, 1, 4);
+            var tileWidth = Math.Clamp((panel.ClientSize.Width - panel.Padding.Horizontal - columnCount * 6) / columnCount,
+                155, 220);
             foreach (var button in shortcutButtons) button.Width = tileWidth;
         }
     }
@@ -2046,17 +2037,17 @@ internal sealed class MainForm : Form
             var shortcut = button.Tag is SortedFolderShortcut;
             var themeAccent = dark ? Color.FromArgb(91, 143, 106) : Color.FromArgb(45, 102, 177);
             button.BackColor = accent || navigationSelected ? themeAccent :
-                shortcut ? (dark ? Color.FromArgb(37, 51, 73) : Color.White) :
+                shortcut ? (dark ? Color.FromArgb(35, 51, 41) : Color.White) :
                 navigation ? (dark ? Color.FromArgb(22, 33, 27) : Color.White) :
                 (dark ? Color.FromArgb(42, 58, 48) : Color.FromArgb(239, 243, 248));
             button.ForeColor = accent || navigationSelected ? Color.White : text;
             button.FlatStyle = FlatStyle.Flat;
             button.FlatAppearance.BorderColor = accent || navigationSelected ? themeAccent :
                 shortcut && button.Tag is SortedFolderShortcut folderShortcut
-                    ? (dark ? Color.FromArgb(71, 85, 105) : ControlPaint.Light(folderShortcut.Color)) : border;
+                    ? (dark ? Color.FromArgb(65, 86, 70) : ControlPaint.Light(folderShortcut.Color)) : border;
             button.FlatAppearance.BorderSize = navigation ? 0 : button.FlatAppearance.BorderSize;
             button.FlatAppearance.MouseOverBackColor = navigationSelected || accent ? themeAccent : shortcut
-                ? (dark ? Color.FromArgb(51, 65, 85) : Color.FromArgb(235, 242, 250))
+                ? (dark ? Color.FromArgb(45, 65, 51) : Color.FromArgb(235, 242, 250))
                 : navigation ? (dark ? Color.FromArgb(35, 51, 41) : Color.FromArgb(235, 242, 250))
                 : (dark ? Color.FromArgb(57, 76, 63) : Color.FromArgb(229, 236, 245));
         }
@@ -2064,7 +2055,7 @@ internal sealed class MainForm : Form
         {
             tree.BackColor = input;
             tree.ForeColor = text;
-            tree.LineColor = dark ? Color.FromArgb(100, 116, 139) : Color.FromArgb(148, 163, 184);
+            tree.LineColor = dark ? Color.FromArgb(108, 130, 114) : Color.FromArgb(148, 163, 184);
         }
         else if (control is DataGridView grid)
         {
@@ -2072,12 +2063,12 @@ internal sealed class MainForm : Form
             grid.GridColor = border;
             grid.DefaultCellStyle.BackColor = surface;
             grid.DefaultCellStyle.ForeColor = text;
-            grid.DefaultCellStyle.SelectionBackColor = dark ? Color.FromArgb(30, 64, 175) : Color.FromArgb(220, 234, 251);
+            grid.DefaultCellStyle.SelectionBackColor = dark ? Color.FromArgb(53, 93, 64) : Color.FromArgb(220, 234, 251);
             grid.DefaultCellStyle.SelectionForeColor = Color.White;
             grid.RowsDefaultCellStyle.BackColor = surface;
             grid.RowsDefaultCellStyle.ForeColor = text;
-            grid.AlternatingRowsDefaultCellStyle.BackColor = dark ? Color.FromArgb(37, 51, 73) : Color.FromArgb(248, 250, 252);
-            grid.ColumnHeadersDefaultCellStyle.BackColor = dark ? Color.FromArgb(51, 65, 85) : Color.FromArgb(241, 245, 249);
+            grid.AlternatingRowsDefaultCellStyle.BackColor = dark ? Color.FromArgb(35, 51, 41) : Color.FromArgb(248, 250, 252);
+            grid.ColumnHeadersDefaultCellStyle.BackColor = dark ? Color.FromArgb(42, 58, 48) : Color.FromArgb(241, 245, 249);
             grid.ColumnHeadersDefaultCellStyle.ForeColor = text;
             grid.ColumnHeadersDefaultCellStyle.SelectionBackColor = grid.ColumnHeadersDefaultCellStyle.BackColor;
             grid.ColumnHeadersDefaultCellStyle.SelectionForeColor = text;

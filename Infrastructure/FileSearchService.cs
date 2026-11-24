@@ -128,20 +128,20 @@ public sealed class FileSearchService
                 continue;
             }
 
+            var length = info.Length;
+            var lastWriteTicks = info.LastWriteTimeUtc.Ticks;
             var current = item;
-            if (info.Length != item.SizeBytes || info.LastWriteTimeUtc.Ticks != item.LastWriteTicks)
+            if (length != item.SizeBytes || lastWriteTicks != item.LastWriteTicks)
             {
                 var refreshed = await ReadDocumentAsync(item.FilePath, cancellationToken);
-                if (refreshed is null)
-                {
-                    await _searchIndex.RemoveSearchDocumentAsync(item.FileId, cancellationToken);
-                    continue;
-                }
+                if (refreshed is null) continue;
 
                 info.Refresh();
+                if (!info.Exists || info.Length != length || info.LastWriteTimeUtc.Ticks != lastWriteTicks)
+                    continue;
                 current = new SearchIndexDocument(item.FileId, refreshed.Path, refreshed.Name, refreshed.FileType,
                     refreshed.Content, PrepareSearchTerms(refreshed.Name), PrepareSearchTerms(refreshed.Content),
-                    info.Length, info.LastWriteTimeUtc.Ticks, string.Join(' ', refreshed.NameTokens),
+                    length, lastWriteTicks, string.Join(' ', refreshed.NameTokens),
                     string.Join(' ', refreshed.ContentTokens));
                 await _searchIndex.UpsertSearchDocumentAsync(current, cancellationToken);
             }
