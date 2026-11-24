@@ -30,6 +30,7 @@ public interface IFileSearchIndex
     Task UpsertSearchDocumentAsync(SearchIndexDocument document, CancellationToken cancellationToken = default);
     Task RemoveSearchDocumentAsync(string fileId, CancellationToken cancellationToken = default);
     Task<SearchIndexMetadata?> GetSearchIndexMetadataAsync(string fileId, CancellationToken cancellationToken = default);
+    Task<bool> HasSearchIndexDocumentsAsync(CancellationToken cancellationToken = default);
     Task<IReadOnlyList<SearchIndexDocument>> SearchIndexAsync(string matchExpression, IReadOnlyList<string> terms, int take,
         CancellationToken cancellationToken = default);
     Task<bool> IsSearchIndexReadyAsync(CancellationToken cancellationToken = default);

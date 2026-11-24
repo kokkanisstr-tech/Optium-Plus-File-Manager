@@ -58,7 +58,8 @@ public sealed class FileSearchService
         {
             try
             {
-                if (await _searchIndex.IsSearchIndexReadyAsync(cancellationToken))
+                if (await _searchIndex.IsSearchIndexReadyAsync(cancellationToken) &&
+                    await _searchIndex.HasSearchIndexDocumentsAsync(cancellationToken))
                     return await SearchIndexedAsync(query, parsedQuery, cancellationToken);
             }
             catch (SqliteException)

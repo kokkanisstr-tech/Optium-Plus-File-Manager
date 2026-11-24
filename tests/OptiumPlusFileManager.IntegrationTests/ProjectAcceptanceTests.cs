@@ -40,6 +40,55 @@ public sealed class ProjectAcceptanceTests
     }
 
     [Fact]
+    public async Task Startup_indexes_sorted_files_without_history_into_persistent_search_index()
+    {
+        string? expected = null;
+        await using var app = await TestApp.CreateAsync(paths =>
+        {
+            var folder = Path.Combine(paths.Sorted, "Programming", "CSharp");
+            Directory.CreateDirectory(folder);
+            expected = Path.Combine(folder, "MathTool.cs");
+            File.WriteAllText(expected, "public static class MathTool { public static int Add(int a, int b) => a + b; }");
+        });
+
+        FileSearchResult? result = null;
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        do
+        {
+            result = await app.Runtime.SearchFilesAsync("math C#");
+            if (result.Message.Contains("постоянному индексу", StringComparison.OrdinalIgnoreCase)) break;
+            await Task.Delay(50);
+        } while (DateTime.UtcNow < deadline);
+
+        Assert.NotNull(result);
+        Assert.Contains(result!.Matches, hit => hit.FilePath.Equals(expected, StringComparison.OrdinalIgnoreCase));
+        Assert.Contains("постоянному индексу", result.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Processing_adds_new_file_content_to_persistent_search_index()
+    {
+        await using var app = await TestApp.CreateAsync();
+        var file = await app.Runtime.IngestTextAsync("MathTool.cs",
+            "namespace Study; public static class MathTool { public static double Mean(double a, double b) => (a + b) / 2; }",
+            "manual");
+        Assert.Equal(nameof(FileStatus.Completed), file.Status);
+
+        FileSearchResult? result = null;
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        do
+        {
+            result = await app.Runtime.SearchFilesAsync("mean C#");
+            if (result.Message.Contains("постоянному индексу", StringComparison.OrdinalIgnoreCase)) break;
+            await Task.Delay(50);
+        } while (DateTime.UtcNow < deadline);
+
+        Assert.NotNull(result);
+        Assert.Contains(result!.Matches, hit => hit.FilePath.Equals(file.CurrentPath, StringComparison.OrdinalIgnoreCase));
+        Assert.Contains("постоянному индексу", result.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task Natural_language_search_falls_back_to_other_sorted_folders()
     {
         await using var app = await TestApp.CreateAsync();
@@ -1185,7 +1234,7 @@ public sealed class ProjectAcceptanceTests
         public AppSettings Settings { get; }
         public FileSorterRuntime Runtime { get; private set; }
 
-        public static async Task<TestApp> CreateAsync()
+        public static async Task<TestApp> CreateAsync(Action<FileSorterPaths>? prepareSortedFiles = null)
         {
             var root = Path.Combine(Path.GetTempPath(), "OptiumPlusFileManager.IntegrationTests", Guid.NewGuid().ToString("N"));
             var incoming = Path.Combine(root, "incoming");
@@ -1202,6 +1251,8 @@ public sealed class ProjectAcceptanceTests
                 AutoSortConfidence = 0.85,
                 ReviewConfidence = 0.60
             };
+            Directory.CreateDirectory(paths.Sorted);
+            prepareSortedFiles?.Invoke(paths);
             var runtime = new FileSorterRuntime(settings, paths);
             await runtime.InitializeAsync();
             return new TestApp(root, paths, settings, runtime);

@@ -14,6 +14,7 @@ internal sealed class MainForm : Form
     private readonly FileSorterRuntime _runtime;
     private readonly LocalApiServer _apiServer;
     private readonly ApiTokenStore _apiTokens;
+    private readonly CancellationTokenSource _startupCancellation = new();
     private readonly bool _startMinimized;
     private readonly Panel _pageHost = new();
     private readonly Dictionary<string, Control> _pages = new(StringComparer.Ordinal);
@@ -75,6 +76,8 @@ internal sealed class MainForm : Form
     private bool _allowClose;
     private DateTime _lastSortedTreeRefreshUtc = DateTime.MinValue;
     private ImageList? _sortedTreeImages;
+    private readonly List<Image> _sortedTreeImageSources = [];
+    private Task? _startupTask;
 
     public MainForm(FileSorterRuntime runtime, bool startMinimized = false)
     {
@@ -106,11 +109,12 @@ internal sealed class MainForm : Form
         FormClosed += (_, _) =>
         {
             _sortedTreeImages?.Dispose();
+            foreach (var image in _sortedTreeImageSources) image.Dispose();
             foreach (var image in _sortedShortcutImages) image.Dispose();
+            _startupCancellation.Dispose();
         };
         Resize += HandleResize;
         _refreshTimer.Tick += async (_, _) => await RefreshAllAsync(refreshSortedFolders: false);
-        _refreshTimer.Start();
         _runtime.FilesChanged += QueueRefresh;
         _runtime.StatusChanged += message => PostToUi(() => SetStatus(message));
         _runtime.FileSorted += HandleFileSorted;
@@ -147,7 +151,7 @@ internal sealed class MainForm : Form
 
         _pageHost.Dock = DockStyle.Fill;
         _pageHost.Margin = new Padding(12, 0, 0, 0);
-        var pageDefinitions = new (string Key, TabPage Page)[]
+        var pageDefinitions = new (string Key, Panel Page)[]
         {
             ("home", BuildDashboardTab()),
             ("search", BuildSearchTab()),
@@ -324,7 +328,7 @@ internal sealed class MainForm : Form
         }
     }
 
-    private TabPage BuildDashboardTab()
+    private Panel BuildDashboardTab()
     {
         var page = CreateTab("Обзор");
         var layout = NewLayout(1, 5);
@@ -413,7 +417,7 @@ internal sealed class MainForm : Form
         return page;
     }
 
-    private TabPage BuildSearchTab()
+    private Panel BuildSearchTab()
     {
         var page = CreateTab("Поиск файлов");
         var layout = NewLayout(1, 5);
@@ -483,7 +487,7 @@ internal sealed class MainForm : Form
         return page;
     }
 
-    private TabPage BuildReviewTab()
+    private Panel BuildReviewTab()
     {
         var page = CreateTab("На проверку");
         var layout = NewLayout(1, 4);
@@ -537,7 +541,7 @@ internal sealed class MainForm : Form
         return page;
     }
 
-    private TabPage BuildHistoryTab()
+    private Panel BuildHistoryTab()
     {
         var page = CreateTab("История");
         var layout = NewLayout(1, 3);
@@ -610,7 +614,7 @@ internal sealed class MainForm : Form
         return page;
     }
 
-    private TabPage BuildSettingsTab()
+    private Panel BuildSettingsTab()
     {
         var page = CreateTab("Настройки");
         var layout = NewLayout(2, 6);
@@ -733,7 +737,7 @@ internal sealed class MainForm : Form
         return page;
     }
 
-    private TabPage BuildApiTab()
+    private Panel BuildApiTab()
     {
         var page = CreateTab("API и MCP");
         var layout = NewLayout(1, 6);
@@ -801,6 +805,30 @@ internal sealed class MainForm : Form
     {
         if (_startMinimized)
             WindowState = FormWindowState.Minimized;
+
+        SetRuntimeReady(false);
+        SetStatus("Открываю приложение и подготавливаю локальную базу…");
+        _startupTask = Task.Run(() => _runtime.InitializeAsync(_startupCancellation.Token), CancellationToken.None);
+        try
+        {
+            await _startupTask;
+            if (IsDisposed || _startupCancellation.IsCancellationRequested) return;
+            SetRuntimeReady(true);
+            _refreshTimer.Start();
+        }
+        catch (OperationCanceledException) when (_startupCancellation.IsCancellationRequested)
+        {
+            return;
+        }
+        catch (Exception exception)
+        {
+            SetStatus($"Запуск остановился: {exception.Message}");
+            MessageBox.Show(this,
+                $"Приложение открылось, но не завершило инициализацию.\n\n{exception.GetType().Name}: {exception.Message}",
+                "Optium+ File Manager — ошибка запуска", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+
         try
         {
             await _apiServer.StartAsync();
@@ -1058,7 +1086,7 @@ internal sealed class MainForm : Form
     private static int CountChildFiles(TreeNode node) => node.Nodes.Cast<TreeNode>()
         .Sum(child => child.Name == "sorted-file" ? 1 : CountChildFiles(child));
 
-    private static ImageList CreateSortedTreeImageList()
+    private ImageList CreateSortedTreeImageList()
     {
         var images = new ImageList { ColorDepth = ColorDepth.Depth32Bit, ImageSize = new Size(26, 26), TransparentColor = Color.Transparent };
         var icons = new (string Key, string Badge, Color Color)[]
@@ -1075,7 +1103,8 @@ internal sealed class MainForm : Form
         };
         foreach (var icon in icons)
         {
-            using var bitmap = CreateFolderIcon(26, icon.Color, icon.Badge.Trim());
+            var bitmap = CreateFolderIcon(26, icon.Color, icon.Badge.Trim());
+            _sortedTreeImageSources.Add(bitmap);
             images.Images.Add(icon.Key, bitmap);
         }
         return images;
@@ -1942,13 +1971,30 @@ internal sealed class MainForm : Form
         if (_allowClose) return;
         e.Cancel = true;
         _allowClose = true;
+        _startupCancellation.Cancel();
         _activeSearch?.Cancel();
         _refreshTimer.Stop();
         _trayIcon.Visible = false;
         await _apiServer.StopAsync();
+        if (_startupTask is not null)
+        {
+            try { await _startupTask; }
+            catch (OperationCanceledException) { }
+            catch (Exception) { }
+        }
         _runtime.FilesChanged -= QueueRefresh;
         _runtime.FileSorted -= HandleFileSorted;
         Close();
+    }
+
+    private void SetRuntimeReady(bool ready)
+    {
+        _pageHost.Enabled = ready;
+        _globalSearch.Enabled = ready;
+        _globalSearchButton.Enabled = ready;
+        AllowDrop = ready;
+        foreach (var button in _navigationButtons.Values)
+            button.Enabled = ready;
     }
 
     private void QueueRefresh() => PostToUi(async () => await RefreshAllAsync());
@@ -1995,8 +2041,8 @@ internal sealed class MainForm : Form
     private static void ApplyThemeToControl(Control control, bool dark, Color background, Color surface,
         Color input, Color border, Color text, Color muted)
     {
-        if (control is Form or TabPage or Panel or TableLayoutPanel or FlowLayoutPanel or SplitContainer)
-            control.BackColor = control is TabPage or Panel or TableLayoutPanel or FlowLayoutPanel or SplitContainer ? surface : background;
+        if (control is Form or Panel or TableLayoutPanel or FlowLayoutPanel or SplitContainer)
+            control.BackColor = control is Panel or TableLayoutPanel or FlowLayoutPanel or SplitContainer ? surface : background;
 
         if (control is Label label)
         {
@@ -2092,7 +2138,12 @@ internal sealed class MainForm : Form
 
     private sealed record SortedFolderShortcut(string DisplayName, string Path, string Badge, Color Color);
 
-    private static TabPage CreateTab(string title) => new(title) { Padding = new Padding(14), BackColor = Color.White };
+    private static Panel CreateTab(string title) => new()
+    {
+        Name = title.Replace(' ', '_'),
+        Padding = new Padding(14),
+        BackColor = Color.White
+    };
 
     private static TableLayoutPanel NewLayout(int columns, int rows) => new()
     {

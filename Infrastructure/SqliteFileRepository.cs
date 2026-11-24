@@ -238,6 +238,15 @@ public sealed class SqliteFileRepository : IFileRepository, IFileSearchIndex
             : null;
     }
 
+    public async Task<bool> HasSearchIndexDocumentsAsync(CancellationToken cancellationToken = default)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT EXISTS(SELECT 1 FROM SearchIndexDocuments LIMIT 1);";
+        var value = await command.ExecuteScalarAsync(cancellationToken);
+        return Convert.ToInt64(value, System.Globalization.CultureInfo.InvariantCulture) != 0;
+    }
+
     public async Task<IReadOnlyList<SearchIndexDocument>> SearchIndexAsync(string matchExpression,
         IReadOnlyList<string> terms, int take,
         CancellationToken cancellationToken = default)
@@ -249,12 +258,13 @@ public sealed class SqliteFileRepository : IFileRepository, IFileSearchIndex
         var nameMatches = BuildMatchedTermsSql("d.NameTerms", terms.Count, "nameTerm");
         var contentMatches = BuildMatchedTermsSql("d.ContentTerms", terms.Count, "contentTerm");
         command.CommandText = $"""
-            SELECT d.FileId, f.CurrentPath, d.FileName, d.FileType, substr(d.Content, 1, 8000),
+            SELECT d.FileId, COALESCE(f.CurrentPath, d.FilePath), d.FileName, d.FileType, substr(d.Content, 1, 8000),
                 d.SizeBytes, d.LastWriteTicks, {nameMatches}, {contentMatches}
             FROM SearchIndexFts
             JOIN SearchIndexDocuments d ON d.RowId=SearchIndexFts.rowid
-            JOIN Files f ON f.Id=d.FileId
-            WHERE SearchIndexFts MATCH $match AND f.Status='Completed'
+            LEFT JOIN Files f ON f.Id=d.FileId
+            WHERE SearchIndexFts MATCH $match AND
+                ((f.Id IS NULL AND d.FileId LIKE 'manual:%') OR f.Status='Completed')
             ORDER BY bm25(SearchIndexFts, 4.0, 1.0), d.FileName COLLATE NOCASE
             LIMIT $take;
             """;

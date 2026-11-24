@@ -2,6 +2,7 @@ using OptiumPlusFileManager.Application;
 using OptiumPlusFileManager.Domain;
 using OptiumPlusFileManager.Infrastructure;
 using System.IO.Enumeration;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace OptiumPlusFileManager.Worker;
@@ -56,10 +57,13 @@ public sealed class FileSorterRuntime : IAsyncDisposable
 
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
     {
+        StatusChanged?.Invoke("Подготовка папок и настроек…");
         Paths.EnsureCreated();
         NormalizeSettings();
+        StatusChanged?.Invoke("Подключение к локальной базе и индексу поиска…");
         await _repository.InitializeAsync(cancellationToken);
         await _repository.ReplaceWatchFoldersAsync(Settings.WatchFolders, Settings.WatchSubdirectories, cancellationToken);
+        StatusChanged?.Invoke("Восстановление незавершённой обработки файлов…");
         var retry = await _processor.RecoverPendingAsync(cancellationToken);
         var allowedRoots = Settings.WatchFolders.Append(Paths.Inbox).ToArray();
         foreach (var file in retry)
@@ -76,7 +80,11 @@ public sealed class FileSorterRuntime : IAsyncDisposable
             _searchIndexTask = Task.Run(() => RebuildSearchIndexAsync(searchIndex, _searchIndexCancellation.Token),
                 CancellationToken.None);
         if (Settings.AutomaticSorting)
+        {
+            StatusChanged?.Invoke("Запуск автоматической сортировки и наблюдения за папками…");
             await _watchService.ConfigureAsync(cancellationToken);
+        }
+        StatusChanged?.Invoke("Приложение готово к работе.");
     }
 
     public async Task SetWatchFoldersAsync(IEnumerable<string> folders, CancellationToken cancellationToken = default)
@@ -377,10 +385,16 @@ public sealed class FileSorterRuntime : IAsyncDisposable
             var extractor = new SafeContentExtractor();
             using var concurrency = new SemaphoreSlim(2, 2);
             var indexedCount = 0;
+            var managedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             for (var skip = 0; ; skip += 1000)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var files = await _repository.ListAsync(nameof(FileStatus.Completed), 1000, cancellationToken, skip);
+                foreach (var file in files)
+                {
+                    if (FileSafety.IsWithin(file.CurrentPath, Paths.Sorted))
+                        managedPaths.Add(Path.GetFullPath(file.CurrentPath));
+                }
                 var tasks = files.Select(async file =>
                 {
                     await concurrency.WaitAsync(cancellationToken);
@@ -394,6 +408,27 @@ public sealed class FileSorterRuntime : IAsyncDisposable
                 });
                 await Task.WhenAll(tasks);
                 if (files.Count < 1000) break;
+            }
+
+            var looseTasks = new List<Task>(16);
+            foreach (var path in EnumerateSortedFiles(cancellationToken))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (managedPaths.Contains(path)) continue;
+                var fileId = CreateLooseSearchIndexId(path);
+                looseTasks.Add(IndexLooseFileAsync(fileId, path, searchIndex, detector, extractor, concurrency,
+                    cancellationToken));
+                if (looseTasks.Count < 16) continue;
+                await Task.WhenAll(looseTasks);
+                indexedCount += looseTasks.Count;
+                looseTasks.Clear();
+                if (indexedCount % 100 == 0)
+                    StatusChanged?.Invoke($"Подготовлен поиск по файлам: {indexedCount}.");
+            }
+            if (looseTasks.Count > 0)
+            {
+                await Task.WhenAll(looseTasks);
+                indexedCount += looseTasks.Count;
             }
 
             await searchIndex.SetSearchIndexReadyAsync(true, cancellationToken);
@@ -440,6 +475,80 @@ public sealed class FileSorterRuntime : IAsyncDisposable
         {
             // A single inaccessible or damaged file should not prevent indexing the rest of the library.
         }
+    }
+
+    private async Task IndexLooseFileAsync(string fileId, string path, IFileSearchIndex searchIndex,
+        FileFormatDetector detector, SafeContentExtractor extractor, SemaphoreSlim concurrency,
+        CancellationToken cancellationToken)
+    {
+        await concurrency.WaitAsync(cancellationToken);
+        try
+        {
+            if (!FileSafety.IsWithin(path, Paths.Sorted) || FileSafety.HasReparsePoint(path) || !File.Exists(path))
+            {
+                await searchIndex.RemoveSearchDocumentAsync(fileId, cancellationToken);
+                return;
+            }
+
+            var info = new FileInfo(path);
+            var current = await searchIndex.GetSearchIndexMetadataAsync(fileId, cancellationToken);
+            if (current is not null && current.SizeBytes == info.Length && current.LastWriteTicks == info.LastWriteTimeUtc.Ticks)
+                return;
+
+            var originalLength = info.Length;
+            var originalLastWriteTicks = info.LastWriteTimeUtc.Ticks;
+            var format = await detector.DetectAsync(path, cancellationToken);
+            var content = await extractor.ExtractAsync(path, format.FileType, cancellationToken);
+            info.Refresh();
+            if (!info.Exists || info.Length != originalLength || info.LastWriteTimeUtc.Ticks != originalLastWriteTicks)
+                return;
+
+            await searchIndex.UpsertSearchDocumentAsync(new SearchIndexDocument(fileId, path, Path.GetFileName(path),
+                format.FileType, content.Text, FileSearchService.PrepareSearchTerms(Path.GetFileName(path)),
+                FileSearchService.PrepareSearchTerms(content.Text), info.Length, info.LastWriteTimeUtc.Ticks), cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException or ArgumentException)
+        {
+            // Keep indexing the rest of the library when an unmanaged item cannot be read.
+        }
+        finally { concurrency.Release(); }
+    }
+
+    private IEnumerable<string> EnumerateSortedFiles(CancellationToken cancellationToken)
+    {
+        if (!Directory.Exists(Paths.Sorted) || FileSafety.HasReparsePoint(Paths.Sorted)) yield break;
+        var root = Path.GetFullPath(Paths.Sorted);
+        var pending = new Stack<string>();
+        pending.Push(root);
+        while (pending.Count > 0)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var directory = pending.Pop();
+            IEnumerable<string> entries;
+            try { entries = Directory.EnumerateFileSystemEntries(directory).ToArray(); }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { continue; }
+
+            foreach (var entry in entries)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                FileAttributes attributes;
+                try { attributes = File.GetAttributes(entry); }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { continue; }
+                if ((attributes & FileAttributes.ReparsePoint) != 0 || !FileSafety.IsWithin(entry, root)) continue;
+                if ((attributes & FileAttributes.Directory) != 0)
+                    pending.Push(Path.GetFullPath(entry));
+                else
+                    yield return Path.GetFullPath(entry);
+            }
+        }
+    }
+
+    private static string CreateLooseSearchIndexId(string path)
+    {
+        var stablePath = Path.GetFullPath(path).ToUpperInvariant();
+        var digest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(stablePath))).ToLowerInvariant();
+        return "manual:" + digest;
     }
 
     private async Task<HashSet<string>> GetKnownLocalOnlySearchPathsAsync(CancellationToken cancellationToken)
