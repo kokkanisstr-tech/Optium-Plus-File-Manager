@@ -118,6 +118,7 @@ dotnet test OptiumPlusFileManager.sln -c Release
 
 ## Материалы проекта
 
+- [Техническое задание и план развития 2.0](PROJECT_PLAN.md)
 - [Руководство пользователя](docs/USER_GUIDE.md)
 - [Архитектура и база данных](docs/ARCHITECTURE.md)
 - [REST API и MCP](docs/API_MCP.md)
